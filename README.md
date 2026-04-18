@@ -29,7 +29,11 @@ app/
 - `POST /track`
 - `GET /history/{id}`
 
-> Note: scraping is intentionally not implemented yet. Retailer adapters currently expose metadata only.
+## Retailer adapter status
+
+- Tesco: metadata scaffold
+- Morrisons: parsing scaffold
+- Ocado: public search/product structured-data parsing wired into `GET /search` and `POST /track`
 
 ## Local run (without Docker)
 
