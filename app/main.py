@@ -3,7 +3,6 @@ from __future__ import annotations
 from fastapi import Depends, FastAPI, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.adapters.ocado import OcadoAdapter
 from app.adapters.registry import registry
 from app.db import get_db
 from app.models import PriceHistory, Product
@@ -55,11 +54,11 @@ def search(
     retailer: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> list[ProductOut]:
-    if retailer == "ocado" and q:
-        adapter = registry.get("ocado")
-        if isinstance(adapter, OcadoAdapter):
+    if retailer and q:
+        adapter = registry.get(retailer)
+        if adapter and hasattr(adapter, "search_products"):
             parsed_products = adapter.search_products(q)
-            products = [upsert_from_parsed(db, "ocado", parsed) for parsed in parsed_products]
+            products = [upsert_from_parsed(db, retailer, parsed) for parsed in parsed_products]
             return [_to_product_out(product) for product in products]
 
     products = list_products(db, query=q, retailer=retailer)
@@ -72,12 +71,9 @@ def track(payload: TrackRequest, db: Session = Depends(get_db)) -> TrackResponse
     if adapter is None:
         raise HTTPException(status_code=400, detail=f"Unsupported retailer '{payload.retailer}'")
 
-    if payload.retailer == "ocado" and payload.url:
-        if not isinstance(adapter, OcadoAdapter):
-            raise HTTPException(status_code=500, detail="Ocado adapter not initialized correctly")
-
+    if payload.url and hasattr(adapter, "fetch_product"):
         parsed = adapter.fetch_product(str(payload.url))
-        product = upsert_from_parsed(db, "ocado", parsed)
+        product = upsert_from_parsed(db, payload.retailer, parsed)
         return TrackResponse(message="tracking updated", product=_to_product_out(product))
 
     if not payload.external_id or not payload.name or payload.price is None:

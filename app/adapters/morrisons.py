@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 
 import requests
 
@@ -15,21 +15,15 @@ from app.adapters.base import RetailerInfo
 class MorrisonsParsedProduct:
     external_id: str
     name: str
-    price: float
-    currency: str
-    url: str
-    image_url: str | None = None
+    price_gbp: float
+    product_url: str
     brand: str | None = None
+    image_url: str | None = None
 
 
 class MorrisonsAdapter:
-    """Morrisons adapter scaffolding.
-
-    This adapter mirrors the Tesco adapter structure while providing
-    Morrisons-specific parsing helpers that can be wired to ingestion flows later.
-    """
-
-    info = RetailerInfo(key="morrisons", name="Morrisons", scraping_implemented=False)
+    info = RetailerInfo(key="morrisons", name="Morrisons", scraping_implemented=True)
+    base_url = "https://groceries.morrisons.com"
 
     def __init__(self, timeout: int = 15) -> None:
         self.timeout = timeout
@@ -45,27 +39,30 @@ class MorrisonsAdapter:
         parsed = urlparse(url)
         return parsed.netloc.endswith("groceries.morrisons.com") or parsed.netloc.endswith("morrisons.com")
 
-    def discover_product_urls(self, query: str, limit: int = 20) -> list[str]:
-        """Discover product URLs from Morrisons search page.
-
-        Note: this does not run in API flows yet.
-        """
-        search_url = f"https://groceries.morrisons.com/search?entry={quote_plus(query)}"
+    def search_products(self, query: str, limit: int = 20) -> list[MorrisonsParsedProduct]:
+        search_url = f"{self.base_url}/search?entry={quote_plus(query)}"
         response = self.session.get(search_url, timeout=self.timeout)
         response.raise_for_status()
 
-        # Morrisons pages include product links under `/products/...`.
         links = set(re.findall(r'href=["\'](/products/[^"\'#?]+)', response.text))
-        urls = [f"https://groceries.morrisons.com{path}" for path in links]
-        return urls[:limit]
+        products: list[MorrisonsParsedProduct] = []
+        for path in links:
+            url = urljoin(self.base_url, path)
+            try:
+                products.append(self.fetch_product(url))
+            except Exception:
+                continue
+            if len(products) >= limit:
+                break
+
+        return products
+
+    def fetch_product(self, product_url: str) -> MorrisonsParsedProduct:
+        response = self.session.get(product_url, timeout=self.timeout)
+        response.raise_for_status()
+        return self.parse_product_page(response.text, product_url)
 
     def parse_product_page(self, html: str, url: str) -> MorrisonsParsedProduct:
-        """Parse Morrisons product HTML.
-
-        Parsing strategy:
-        1) Preferred: `application/ld+json` product node.
-        2) Fallback: JSON blob in `window.__PRELOADED_STATE__`.
-        """
         product_data = self._extract_ld_json_product(html)
         if product_data is None:
             product_data = self._extract_preloaded_state_product(html)
@@ -80,17 +77,11 @@ class MorrisonsAdapter:
         return MorrisonsParsedProduct(
             external_id=external_id,
             name=str(product_data.get("name") or "Unknown product").strip(),
-            price=float(price_raw),
-            currency=str(product_data.get("priceCurrency") or product_data.get("currency") or "GBP").upper(),
-            url=url,
+            price_gbp=float(price_raw),
+            product_url=url,
             image_url=self._normalize_image(product_data.get("image") or product_data.get("imageUrl")),
             brand=self._normalize_brand(product_data.get("brand")),
         )
-
-    def fetch_and_parse_product(self, url: str) -> MorrisonsParsedProduct:
-        response = self.session.get(url, timeout=self.timeout)
-        response.raise_for_status()
-        return self.parse_product_page(response.text, url)
 
     @staticmethod
     def _extract_ld_json_product(html: str) -> dict[str, Any] | None:
@@ -128,7 +119,6 @@ class MorrisonsAdapter:
         except json.JSONDecodeError:
             return None
 
-        # This shape may vary by release; we intentionally keep fallback permissive.
         if isinstance(state, dict):
             product = state.get("product") or state.get("currentProduct")
             if isinstance(product, dict):

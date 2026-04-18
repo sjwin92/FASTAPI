@@ -16,3 +16,9 @@ class RetailerAdapter(Protocol):
 
     def is_supported_url(self, url: str) -> bool:
         """Return true if URL belongs to this retailer."""
+
+    def search_products(self, query: str, limit: int = 20):
+        """Search retailer public pages and return parsed products."""
+
+    def fetch_product(self, product_url: str):
+        """Fetch and parse one public product page."""

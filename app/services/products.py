@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from typing import Any
+
 from sqlalchemy import Select, desc, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.adapters.ocado import OcadoParsedProduct
 from app.models import PriceHistory, Product
 from app.schemas import TrackRequest
 
@@ -20,33 +21,52 @@ def list_products(db: Session, query: str | None = None, retailer: str | None = 
     return db.execute(stmt).scalars().unique().all()
 
 
-def upsert_from_parsed(db: Session, retailer: str, parsed: OcadoParsedProduct) -> Product:
+def _from_parsed(parsed: Any) -> dict[str, Any]:
+    product_url = getattr(parsed, "product_url", None) or getattr(parsed, "url", None)
+    price = getattr(parsed, "price_gbp", None)
+    if price is None:
+        price = getattr(parsed, "price", None)
+
+    return {
+        "external_id": getattr(parsed, "external_id"),
+        "name": getattr(parsed, "name"),
+        "url": product_url,
+        "brand": getattr(parsed, "brand", None),
+        "image_url": getattr(parsed, "image_url", None),
+        "price": float(price),
+        "currency": getattr(parsed, "currency", "GBP"),
+    }
+
+
+def upsert_from_parsed(db: Session, retailer: str, parsed: Any) -> Product:
+    normalized = _from_parsed(parsed)
+
     stmt = select(Product).where(
         Product.retailer == retailer,
-        Product.external_id == parsed.external_id,
+        Product.external_id == normalized["external_id"],
     )
     product = db.execute(stmt).scalar_one_or_none()
 
     if product is None:
         product = Product(
             retailer=retailer,
-            external_id=parsed.external_id,
-            name=parsed.name,
-            url=parsed.product_url,
-            brand=parsed.brand,
-            image_url=parsed.image_url,
-            currency="GBP",
+            external_id=normalized["external_id"],
+            name=normalized["name"],
+            url=normalized["url"],
+            brand=normalized["brand"],
+            image_url=normalized["image_url"],
+            currency=normalized["currency"],
         )
         db.add(product)
         db.flush()
     else:
-        product.name = parsed.name
-        product.url = parsed.product_url
-        product.brand = parsed.brand
-        product.image_url = parsed.image_url
-        product.currency = "GBP"
+        product.name = normalized["name"]
+        product.url = normalized["url"]
+        product.brand = normalized["brand"]
+        product.image_url = normalized["image_url"]
+        product.currency = normalized["currency"]
 
-    db.add(PriceHistory(product_id=product.id, price=parsed.price_gbp))
+    db.add(PriceHistory(product_id=product.id, price=normalized["price"]))
     db.commit()
     db.refresh(product)
     return product
