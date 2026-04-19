@@ -9,9 +9,9 @@ external_id is stored as the full URL path slug, e.g.
   "essential-semi-skimmed-milk/0-331187-44330-00"
 This lets fetch_price reconstruct the exact product URL without a DB lookup.
 
-Known limitation: Waitrose's Akamai CDN may time-out or block server-side
-requests in some network environments. All HTTP failures return [] / None
-gracefully; callers see an empty result set rather than an error.
+Known limitation: Waitrose's Akamai CDN TCP-drops server-side requests
+(connects then never responds). Timeout is set to 8s so the adapter fails
+fast rather than blocking basket/compare for 15s.
 """
 
 from __future__ import annotations
@@ -262,7 +262,7 @@ class WaitroseAdapter(BaseAdapter):
             resp = _SESSION.get(
                 _SEARCH_URL,
                 params={"searchTerm": query},
-                timeout=15,
+                timeout=8,
             )
             resp.raise_for_status()
             html = resp.text
@@ -293,7 +293,7 @@ class WaitroseAdapter(BaseAdapter):
     def fetch_price(self, external_id: str) -> ProductResult | None:
         url = f"{_PRODUCT_BASE}/{external_id}"
         try:
-            resp = _SESSION.get(url, timeout=15)
+            resp = _SESSION.get(url, timeout=8)
             resp.raise_for_status()
             html = resp.text
         except Exception:
