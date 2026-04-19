@@ -2,20 +2,27 @@ from .base import BaseAdapter
 from .tesco import TescoAdapter
 from .ocado import OcadoAdapter
 from .morrisons import MorrisonsAdapter
-from .waitrose import WaitroseAdapter
 from .sainsburys import SainsburysAdapter
+from .trolley import TrolleyRetailerAdapter
 
 _ADAPTERS: dict[str, BaseAdapter] = {
     a.retailer_key: a()
-    for a in [TescoAdapter, OcadoAdapter, MorrisonsAdapter, WaitroseAdapter, SainsburysAdapter]
+    for a in [TescoAdapter, OcadoAdapter, MorrisonsAdapter, SainsburysAdapter]
 }
+
+# Waitrose TCP-drops server-side requests via Akamai CDN — use trolley.co.uk as source.
+# Asda and Iceland have no direct public API; trolley covers them too.
+for _key in ("waitrose", "asda", "iceland"):
+    _ADAPTERS[_key] = TrolleyRetailerAdapter(_key)
 
 RETAILER_NAMES: dict[str, str] = {
     "tesco": "Tesco",
     "ocado": "Ocado",
     "morrisons": "Morrisons",
-    "waitrose": "Waitrose",
     "sainsburys": "Sainsbury's",
+    "waitrose": "Waitrose",
+    "asda": "Asda",
+    "iceland": "Iceland",
 }
 
 
