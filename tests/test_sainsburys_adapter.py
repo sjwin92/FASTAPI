@@ -123,6 +123,9 @@ class TestExtractSize:
     def test_pints(self):
         assert _extract_size("Whole Milk 6 pints") == "6 pints"
 
+    def test_dual_label_keeps_derived_field_but_quantity_parser_prefers_metric(self):
+        assert _extract_size("Whole Milk 1.13L (2 pint)") == "2 pint"
+
     def test_no_size(self):
         assert _extract_size("Organic Honey") is None
 

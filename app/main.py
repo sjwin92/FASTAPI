@@ -7,6 +7,7 @@ import secrets
 import threading
 import time
 import uuid
+from decimal import Decimal
 
 from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,17 +31,18 @@ from app.schemas import (
     RetailerBasketResult,
     BasketItem,
     AdapterErrorInfo,
+    BasketCoverageIssueInfo,
 )
-from app.adapters.registry import RETAILER_NAMES
+from app.adapters.registry import RETAILER_NAMES, retailer_metadata
 from app.services.products import search_products, track_product, get_price_history, refresh_prices
-from app.services.price_sync import find_best_prices, compare_basket
+from app.services.price_sync import BasketQuantityRequest, find_best_prices, compare_basket
 from app.supabase_sync import build_price_row, upsert_ingredient_prices
 
 logger = logging.getLogger("kitchen_companion.pricing")
 app = FastAPI(
     title="Kitchen Companion Pricing API",
     description="Basket pricing for Kitchen Companion's buy-missing-items workflow.",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 _cors_origins = [
@@ -142,31 +144,30 @@ def ready():
 
 @app.get("/retailers", response_model=list[RetailerInfo])
 def retailers():
-    return [{"key": k, "name": v} for k, v in RETAILER_NAMES.items()]
+    return retailer_metadata()
 
 
 @app.get("/search", response_model=list[ProductResult])
 def search(
     q: str = Query(..., min_length=1, description="Search query"),
     retailer: str | None = Query(None, description="Filter to a specific retailer key"),
-    db: Session = Depends(get_db),
 ):
     if retailer and retailer not in RETAILER_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown retailer '{retailer}'")
-    results = search_products(q, retailer, db)
+    results = search_products(q, retailer)
     return [
         ProductResult(
-            external_id=r.external_id,
-            name=r.name,
-            retailer=retailer or "unknown",
-            url=r.url,
-            image_url=r.image_url,
-            price=r.price,
-            unit_price=r.unit_price,
-            unit=r.unit,
-            in_stock=r.in_stock,
+            external_id=hit.product.external_id,
+            name=hit.product.name,
+            retailer=hit.retailer,
+            url=hit.product.url,
+            image_url=hit.product.image_url,
+            price=hit.product.price,
+            unit_price=hit.product.unit_price,
+            unit=hit.product.unit,
+            in_stock=hit.product.in_stock,
         )
-        for r in results
+        for hit in results
     ]
 
 
@@ -275,10 +276,23 @@ def basket_compare(payload: BasketCompareRequest):
     Compare the cost of a basket of ingredients across all supported retailers.
     Returns retailers sorted cheapest-first.
     """
-    if not payload.ingredients:
+    if payload.ingredients is not None and not payload.ingredients:
         raise HTTPException(status_code=400, detail="ingredients list must not be empty")
+    if payload.items is not None and not payload.items:
+        raise HTTPException(status_code=400, detail="items list must not be empty")
 
-    baskets = compare_basket(payload.ingredients)
+    if payload.items is not None:
+        requested_items = [
+            BasketQuantityRequest(
+                name=item.name,
+                quantity=Decimal(str(item.quantity)),
+                unit=item.unit,
+            )
+            for item in payload.items
+        ]
+        baskets = compare_basket(items=requested_items)
+    else:
+        baskets = compare_basket(payload.ingredients or [])
 
     return BasketCompareResponse(
         retailers=[
@@ -295,6 +309,11 @@ def basket_compare(payload: BasketCompareRequest):
                 total_is_comparable=b.total_is_comparable,
                 errors=[AdapterErrorInfo(**error.__dict__) for error in b.errors],
                 duration_ms=b.duration_ms,
+                calculation_mode=b.calculation_mode,
+                coverage_issues=[
+                    BasketCoverageIssueInfo(**issue.__dict__)
+                    for issue in b.coverage_issues
+                ],
             )
             for b in baskets
         ]

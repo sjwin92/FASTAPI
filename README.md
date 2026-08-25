@@ -26,6 +26,9 @@ curl http://127.0.0.1:8000/ready
 curl -X POST http://127.0.0.1:8000/basket/compare \
   -H 'Content-Type: application/json' \
   -d '{"ingredients":["milk","pasta"]}'
+curl -X POST http://127.0.0.1:8000/basket/compare \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[{"name":"milk","quantity":1,"unit":"l"}]}'
 ```
 
 Run verification with:
@@ -59,13 +62,26 @@ No environment variable is required for stateless local comparison.
 
 ## Basket contract
 
-`POST /basket/compare` keeps the existing request and item fields. Ingredient strings are whitespace-normalised and case-insensitively deduplicated; at most 50 ingredients and 120 characters per ingredient are accepted.
+`POST /basket/compare` accepts exactly one of two request forms. The legacy form keeps its one-package behaviour:
 
 Request:
 
 ```json
 {"ingredients": ["milk", "pasta"]}
 ```
+
+The structured form proves package coverage and calculates the lowest checkout cost:
+
+```json
+{
+  "items": [
+    {"name": "milk", "quantity": 1, "unit": "l"},
+    {"name": "pasta", "quantity": 500, "unit": "g"}
+  ]
+}
+```
+
+Supported request units are `g`, `kg`, `ml`, `cl`, `l`, and `each`. Quantities must be positive and finite, and `each` must be a whole number. Cooking measures and mass/volume/count conflicts for duplicate names return HTTP 422. Duplicate structured items are combined in canonical mass, volume, or count units. Both forms retain the 50-item and 120-character name limits.
 
 Response shape:
 
@@ -75,7 +91,7 @@ Response shape:
     {
       "retailer": "sainsburys",
       "retailer_name": "Sainsbury's",
-      "total": 1.59,
+      "total": 0.69,
       "items": [
         {
           "ingredient": "milk",
@@ -85,23 +101,35 @@ Response shape:
           "unit": "ltr",
           "url": "https://retailer.example/product",
           "image_url": null,
-          "retrieved_at": "2026-08-25T12:00:00Z"
+          "retrieved_at": "2026-08-25T12:00:00Z",
+          "requested_quantity": 1.0,
+          "requested_unit": "l",
+          "package_quantity": 1000.0,
+          "package_unit": "ml",
+          "packs_needed": 1,
+          "supplied_quantity": 1.0,
+          "excess_quantity": 0.0,
+          "line_total": 0.69
         }
       ],
       "not_found": [],
-      "matched_count": 2,
-      "requested_count": 2,
+      "matched_count": 1,
+      "requested_count": 1,
       "is_complete": true,
       "availability": "available",
       "total_is_comparable": true,
       "errors": [],
-      "duration_ms": 314
+      "duration_ms": 314,
+      "calculation_mode": "quantity_aware",
+      "coverage_issues": []
     }
   ]
 }
 ```
 
-Ranking is `available` complete baskets first, then partial baskets by matched count, then unavailable retailers. Price only breaks ties within the same completeness class. `total` remains the subtotal of matched items for backward compatibility; clients must display it as a basket price only when `total_is_comparable` is `true`.
+For structured requests, `price` remains one pack's price, `line_total` is `price × packs_needed`, and `total` is the sum of line totals. Package quantities use canonical `g`, `ml`, or `each`; supplied and excess quantities use the request unit. Legacy totals remain the sum of one pack per matched ingredient, and responses identify that path with `calculation_mode: "one_pack"`.
+
+Ranking is `available` complete baskets first, then partial baskets by matched count, then unavailable retailers. Price only breaks ties within the same completeness class. Clients must display `total` as a comparable basket price only when `total_is_comparable` is `true`.
 
 `not_found` means the retailer responded but no strongly related product matched. `errors` means the retailer could not be checked, for example:
 
@@ -114,7 +142,9 @@ Ranking is `available` complete baskets first, then partial baskets by matched c
 }
 ```
 
-Matching uses complete, normalised query tokens and rejects substring-only or partial semantic matches. It does not silently substitute unrelated products. Quantities in free-text ingredients are removed from matching, but basket quantities and package-size optimisation are not yet supported.
+`coverage_issues` separates a related but unprovable product from `not_found`. Its codes are `no_acceptable_variant`, `package_size_unknown`, and `unit_incompatible`. Unknown package coverage fails closed, so it cannot make a basket complete or comparable.
+
+Matching requires every meaningful query token and rejects unrequested material forms such as UHT/long-life, powdered, dried, frozen, canned/tinned, condensed, evaporated, flavoured, ready-cooked, and breaded. Structured selection requires an in-stock product with a compatible known package size. It chooses the lowest line checkout cost, then least excess, strongest match, and stable product ID. Conditional promotions, loyalty prices, and multibuy text are not applied.
 
 ## Endpoints
 
@@ -122,8 +152,8 @@ Matching uses complete, normalised query tokens and rejects substring-only or pa
 |---|---|---:|---|
 | GET | `/health` | No | Process liveness. |
 | GET | `/ready` | Configurable | Dependency readiness. |
-| GET | `/retailers` | No | Retailer keys and names. |
-| GET | `/search` | Session only | Search one or all adapters. |
+| GET | `/retailers` | No | Retailer keys, configured enablement, reason, and capabilities. |
+| GET | `/search` | No | Search one or all adapters with the source retailer on every result. |
 | POST | `/basket/compare` | No | Compare complete and partial baskets safely. |
 | POST | `/price-sync` | No | Match ingredients; legacy write is opt-in. |
 | POST | `/track` | Yes | Track a selected product. |
@@ -137,6 +167,8 @@ Every response includes `X-Request-ID`. HTTP and adapter timings are logged with
 Tesco and Trolley explicitly prohibit automated access without permission, so those providers are disabled by default. This makes Tesco, Asda, and Iceland visibly unavailable until an authorised source is configured. Other integrations use undocumented or changing retailer surfaces and may be blocked by CDNs or server IP policy. See [docs/SOURCE_POLICY.md](docs/SOURCE_POLICY.md) before any production use.
 
 Recorded, sanitised response fragments cover parser formats in tests. Live checks are intentionally minimal and must not target policy-disabled sources.
+
+The copyable consumer integration notes are in [docs/FRONTEND_HANDOFF.md](docs/FRONTEND_HANDOFF.md).
 
 ## Docker and low-cost hosting
 

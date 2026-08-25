@@ -46,3 +46,27 @@ def get_adapter(retailer: str) -> BaseAdapter | None:
 
 def all_adapters() -> list[BaseAdapter]:
     return list(_ADAPTERS.values())
+
+
+def retailer_metadata() -> list[dict]:
+    metadata = []
+    for key, name in RETAILER_NAMES.items():
+        adapter = _ADAPTERS[key]
+        enabled = not isinstance(adapter, DisabledAdapter)
+        metadata.append(
+            {
+                "key": key,
+                "name": name,
+                "enabled": enabled,
+                "disabled_reason": (
+                    None
+                    if enabled
+                    else "Automated source disabled pending permission."
+                ),
+                "capabilities": (
+                    ["search", "basket_compare", "quantity_aware"]
+                    if enabled else []
+                ),
+            }
+        )
+    return metadata

@@ -1,4 +1,5 @@
 from datetime import datetime
+from dataclasses import dataclass
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
@@ -8,12 +9,21 @@ from app.adapters.registry import get_adapter, all_adapters
 from app.schemas import TrackRequest
 
 
-def search_products(query: str, retailer: str | None, db: Session) -> list[AdapterResult]:
+@dataclass(frozen=True)
+class RetailerSearchHit:
+    retailer: str
+    product: AdapterResult
+
+
+def search_products(query: str, retailer: str | None) -> list[RetailerSearchHit]:
     adapters = [get_adapter(retailer)] if retailer else all_adapters()
-    results: list[AdapterResult] = []
+    results: list[RetailerSearchHit] = []
     for adapter in adapters:
         if adapter:
-            results.extend(adapter.search(query))
+            results.extend(
+                RetailerSearchHit(adapter.retailer_key, product)
+                for product in adapter.search(query)
+            )
     return results
 
 

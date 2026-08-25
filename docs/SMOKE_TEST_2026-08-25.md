@@ -33,4 +33,17 @@ Request ingredients were `milk`, duplicate `Milk`, and `pasta`; normalisation pr
 
 The run completed in 8.22 seconds. It demonstrates that complete baskets rank before a cheaper partial subtotal and that unavailable £0 subtotals are explicitly non-comparable and placed last.
 
+## Quantity-aware validation
+
+After the 1.2.0 quantity changes, one structured item (`milk`, 1 `l`) was checked once against only the four policy-enabled direct retailer adapters. `ENABLE_RESTRICTED_SOURCES` was asserted false before the run, so Tesco and the Trolley-backed Asda and Iceland sources received no network requests.
+
+| Retailer | Outcome | Selected package | Packs | Line total |
+|---|---|---|---:|---:|
+| Ocado | Covered | M&S Select Farms British Semi Skimmed Milk 2 Pints, 1,136 ml | 1 | £1.20 |
+| Morrisons | Covered | Morrisons British Semi Skimmed Milk 2 Pints, 1,136.5225 ml | 1 | £1.20 |
+| Sainsbury's | Covered | Sainsbury's British Whole Milk 1.13L (2 pint), 1,130 ml | 1 | £1.20 |
+| Waitrose | Unavailable | `source_unavailable` after the bounded timeout | — | — |
+
+The four-source check completed in 10.3 seconds. A focused recheck confirmed that the Sainsbury's dual label uses its explicit 1.13 L metric value rather than the rounded imperial equivalent. The unrequested longer-life UHT result recorded in the earlier legacy smoke check is now rejected by the conservative material-form rule.
+
 Prices are point-in-time smoke-test observations, not promised prices or durable fixtures. Consumers must follow the returned retailer link to verify current price and availability.
