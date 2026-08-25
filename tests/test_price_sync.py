@@ -5,13 +5,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.adapters.base import ProductResult
+from app.adapters.base import AdapterSearchOutcome, ProductResult
 from app.services.price_sync import (
     _normalise,
     _relevance,
     best_match,
     find_best_prices,
     compare_basket,
+    normalise_ingredients,
 )
 
 
@@ -31,6 +32,11 @@ class TestNormalise:
 
     def test_strips_punctuation(self):
         assert "milk" in _normalise("semi-skimmed milk")
+
+    def test_deduplicates_and_trims_ingredients(self):
+        assert normalise_ingredients([" Milk ", "milk", "olive   oil"]) == [
+            "Milk", "olive oil"
+        ]
 
 
 class TestRelevance:
@@ -79,6 +85,13 @@ class TestBestMatch:
     def test_returns_none_if_empty(self):
         assert best_match("milk", []) is None
 
+    def test_rejects_substring_false_positive(self):
+        assert best_match("ham", [self._p("Champagne 75cl", 9.00)]) is None
+
+    def test_requires_every_meaningful_query_token(self):
+        candidates = [self._p("Chicken Breast Fillets 500g", 4.50)]
+        assert best_match("smoked chicken breast", candidates) is None
+
 
 # ---------------------------------------------------------------------------
 # Service layer with mocked adapters
@@ -88,6 +101,7 @@ def _make_adapter(retailer_key: str, results: list[ProductResult]):
     adapter = MagicMock()
     adapter.retailer_key = retailer_key
     adapter.search.return_value = results
+    adapter.search_with_status.return_value = AdapterSearchOutcome(results)
     return adapter
 
 
@@ -127,10 +141,26 @@ class TestFindBestPrices:
     def test_adapter_exception_handled(self, mock_all):
         bad = MagicMock()
         bad.retailer_key = "tesco"
-        bad.search.side_effect = RuntimeError("network error")
+        bad.search_with_status.side_effect = RuntimeError("network error")
         mock_all.return_value = [bad]
         result = find_best_prices(["pasta"])
-        assert result.not_found == ["pasta"]
+        assert result.not_found == []
+        assert result.errors[0].retailer == "tesco"
+        assert result.errors[0].ingredient == "pasta"
+
+    @patch("app.services.price_sync.all_adapters")
+    def test_stops_querying_source_after_first_failure(self, mock_all):
+        bad = MagicMock()
+        bad.retailer_key = "tesco"
+        bad.search_with_status.return_value = AdapterSearchOutcome(
+            [], "source_unavailable"
+        )
+        mock_all.return_value = [bad]
+
+        result = find_best_prices(["milk", "pasta"])
+
+        assert bad.search_with_status.call_count == 1
+        assert [error.ingredient for error in result.errors] == ["milk", "pasta"]
 
     @patch("app.services.price_sync.all_adapters")
     def test_multiple_adapters_picks_cheapest(self, mock_all):
@@ -140,6 +170,68 @@ class TestFindBestPrices:
         ]
         result = find_best_prices(["pasta"])
         assert result.synced[0].product.price == 0.90
+
+
+class TestCompareBasket:
+    def _adapter(self, key, by_query):
+        adapter = MagicMock()
+        adapter.retailer_key = key
+        adapter.search_with_status.side_effect = lambda query: by_query[query]
+        return adapter
+
+    @patch.dict(
+        "app.services.price_sync.RETAILER_NAMES",
+        {"complete": "Complete", "partial": "Partial"},
+        clear=True,
+    )
+    @patch("app.services.price_sync.get_adapter")
+    def test_complete_basket_ranks_before_cheaper_partial_basket(self, mock_get):
+        milk = ProductResult("m", "Whole Milk", "https://example/m", 1.20)
+        pasta = ProductResult("p", "Pasta", "https://example/p", 1.00)
+        cheap_milk = ProductResult("cm", "Whole Milk", "https://example/cm", 0.50)
+        adapters = {
+            "complete": self._adapter(
+                "complete",
+                {
+                    "milk": AdapterSearchOutcome([milk]),
+                    "pasta": AdapterSearchOutcome([pasta]),
+                },
+            ),
+            "partial": self._adapter(
+                "partial",
+                {
+                    "milk": AdapterSearchOutcome([cheap_milk]),
+                    "pasta": AdapterSearchOutcome([]),
+                },
+            ),
+        }
+        mock_get.side_effect = adapters.get
+
+        baskets = compare_basket(["milk", "pasta"])
+
+        assert baskets[0].retailer == "complete"
+        assert baskets[0].is_complete is True
+        assert baskets[1].total == 0.50
+        assert baskets[1].total_is_comparable is False
+
+    @patch.dict(
+        "app.services.price_sync.RETAILER_NAMES",
+        {"broken": "Broken"},
+        clear=True,
+    )
+    @patch("app.services.price_sync.get_adapter")
+    def test_unavailable_retailer_is_not_reported_as_not_found(self, mock_get):
+        adapter = self._adapter(
+            "broken", {"milk": AdapterSearchOutcome([], "source_unavailable")}
+        )
+        mock_get.return_value = adapter
+
+        basket = compare_basket(["milk"])[0]
+
+        assert basket.availability == "unavailable"
+        assert basket.not_found == []
+        assert basket.errors[0].code == "source_unavailable"
+        assert basket.total_is_comparable is False
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +307,17 @@ class TestBasketCompareEndpoint:
         body = resp.json()
         assert body["retailers"][0]["retailer"] == "tesco"
         assert body["retailers"][0]["total"] == 5.40
+        assert "matched_count" in body["retailers"][0]
+        assert "availability" in body["retailers"][0]
 
     def test_empty_ingredients_returns_400(self, client):
         resp = client.post("/basket/compare", json={"ingredients": []})
         assert resp.status_code == 400
+
+    def test_normalises_and_deduplicates_input(self, client):
+        with patch("app.main.compare_basket", return_value=[]) as mock_compare:
+            resp = client.post(
+                "/basket/compare", json={"ingredients": [" Milk ", "milk", "pasta"]}
+            )
+        assert resp.status_code == 200
+        mock_compare.assert_called_once_with(["Milk", "pasta"])

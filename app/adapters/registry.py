@@ -1,19 +1,33 @@
-from .base import BaseAdapter
+import os
+
+from .base import BaseAdapter, DisabledAdapter
 from .tesco import TescoAdapter
 from .ocado import OcadoAdapter
 from .morrisons import MorrisonsAdapter
 from .sainsburys import SainsburysAdapter
 from .trolley import TrolleyRetailerAdapter
+from .waitrose import WaitroseAdapter
+
+_restricted_sources_enabled = (
+    os.getenv("ENABLE_RESTRICTED_SOURCES", "false").casefold() == "true"
+)
 
 _ADAPTERS: dict[str, BaseAdapter] = {
-    a.retailer_key: a()
-    for a in [TescoAdapter, OcadoAdapter, MorrisonsAdapter, SainsburysAdapter]
+    "tesco": TescoAdapter() if _restricted_sources_enabled else DisabledAdapter("tesco"),
+    "ocado": OcadoAdapter(),
+    "morrisons": MorrisonsAdapter(),
+    "sainsburys": SainsburysAdapter(),
+    "waitrose": WaitroseAdapter(),
 }
 
-# Waitrose TCP-drops server-side requests via Akamai CDN — use trolley.co.uk as source.
-# Asda and Iceland have no direct public API; trolley covers them too.
-for _key in ("waitrose", "asda", "iceland"):
-    _ADAPTERS[_key] = TrolleyRetailerAdapter(_key)
+# Trolley's published terms prohibit automated access. Keep the provider behind
+# the adapter interface for authorised deployments, but disable it by default.
+for _key in ("asda", "iceland"):
+    _ADAPTERS[_key] = (
+        TrolleyRetailerAdapter(_key)
+        if _restricted_sources_enabled
+        else DisabledAdapter(_key)
+    )
 
 RETAILER_NAMES: dict[str, str] = {
     "tesco": "Tesco",

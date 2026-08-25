@@ -15,6 +15,7 @@ import requests
 
 _SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 _SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+_LEGACY_SYNC_ENABLED = os.getenv("ENABLE_LEGACY_SUPABASE_SYNC", "false").casefold() == "true"
 
 
 def _headers() -> dict[str, str]:
@@ -28,6 +29,10 @@ def _headers() -> dict[str, str]:
 
 def upsert_ingredient_prices(rows: list[dict[str, Any]]) -> None:
     """Upsert rows into ingredient_prices, conflicting on ingredient_name."""
+    if not _LEGACY_SYNC_ENABLED:
+        raise RuntimeError(
+            "Legacy Supabase sync is disabled; set ENABLE_LEGACY_SUPABASE_SYNC=true explicitly"
+        )
     if not _SUPABASE_URL or not _SERVICE_KEY:
         raise RuntimeError(
             "SUPABASE_URL and SUPABASE_SERVICE_KEY must be set to sync prices"

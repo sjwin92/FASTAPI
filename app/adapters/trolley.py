@@ -16,12 +16,14 @@ sharing the same query only trigger one HTTP round-trip.
 from __future__ import annotations
 
 import html as _html
+import os
 import re
 import threading
-
-import requests
+import time
+from collections import OrderedDict
 
 from .base import BaseAdapter, ProductResult
+from .http import REQUEST_TIMEOUT, create_session
 
 _BASE = "https://www.trolley.co.uk"
 _SEARCH_URL = f"{_BASE}/search/"
@@ -47,12 +49,18 @@ _STORE_KEY: dict[str, str] = {
     "Iceland": "iceland",
 }
 
-_session = requests.Session()
-_session.headers.update(_HEADERS)
+_session = create_session(_HEADERS)
 
-# Per-query result cache
-_cache: dict[str, dict[str, list[ProductResult]]] = {}
+# Per-query result cache. Values retain their original retrieved_at timestamp so
+# consumers can tell when a cached price was obtained.
+_CACHE_TTL_SECONDS = max(1, int(os.getenv("TROLLEY_CACHE_TTL_SECONDS", "300")))
+_CACHE_MAX_ENTRIES = max(1, int(os.getenv("TROLLEY_CACHE_MAX_ENTRIES", "128")))
+_cache: OrderedDict[str, tuple[float, dict[str, list[ProductResult]]]] = OrderedDict()
 _cache_lock = threading.Lock()
+
+
+class _SourceUnavailable(RuntimeError):
+    pass
 
 # --- Regex patterns ---
 
@@ -79,6 +87,7 @@ def _parse_product_page(
     html_text: str,
     trolley_pid: str,
     fallback_title: str,
+    product_url: str | None = None,
 ) -> dict[str, ProductResult]:
     """Parse the Where-To-Buy table; return {retailer_key: ProductResult}."""
     # Product name
@@ -140,7 +149,7 @@ def _parse_product_page(
         results[retailer_key] = ProductResult(
             external_id=trolley_pid,
             name=name,
-            url=f"{_BASE}/product/{trolley_pid}",
+            url=product_url or f"{_BASE}/product/{trolley_pid}",
             price=price,
             unit_price=unit_price,
             unit=unit,
@@ -166,11 +175,11 @@ def _fetch_all(query: str) -> dict[str, list[ProductResult]]:
     so we try non-own-brand slugs first, then fall back to any product.
     """
     try:
-        resp = _session.get(_SEARCH_URL, params={"q": query}, timeout=15)
+        resp = _session.get(_SEARCH_URL, params={"q": query}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         search_html = resp.text
-    except Exception:
-        return {}
+    except Exception as exc:
+        raise _SourceUnavailable from exc
 
     all_links = list(dict.fromkeys(_SEARCH_LINK_RE.findall(search_html)))
     if not all_links:
@@ -182,29 +191,51 @@ def _fetch_all(query: str) -> dict[str, list[ProductResult]]:
     candidates = (branded + own_brand)[:5]
 
     best: dict[str, list[ProductResult]] = {}
+    product_page_failed = False
     for slug, pid in candidates:
+        product_url = f"{_BASE}/product/{slug}/{pid}"
         try:
-            prod_resp = _session.get(f"{_BASE}/product/{slug}/{pid}", timeout=15)
+            prod_resp = _session.get(product_url, timeout=REQUEST_TIMEOUT)
             prod_resp.raise_for_status()
             product_html = prod_resp.text
         except Exception:
+            product_page_failed = True
             continue
 
-        per_retailer = _parse_product_page(product_html, pid, slug.replace("-", " ").title())
+        per_retailer = _parse_product_page(
+            product_html,
+            pid,
+            slug.replace("-", " ").title(),
+            product_url,
+        )
         candidate = {key: [result] for key, result in per_retailer.items()}
         if len(candidate) > len(best):
             best = candidate
         if len(best) >= 4:
             break
 
+    if not best and product_page_failed:
+        raise _SourceUnavailable
     return best
 
 
 def _cached_lookup(query: str) -> dict[str, list[ProductResult]]:
+    key = " ".join(query.lower().split())
+    now = time.monotonic()
     with _cache_lock:
-        if query not in _cache:
-            _cache[query] = _fetch_all(query)
-        return _cache[query]
+        cached = _cache.get(key)
+        if cached and now - cached[0] < _CACHE_TTL_SECONDS:
+            _cache.move_to_end(key)
+            return cached[1]
+        if cached:
+            del _cache[key]
+
+        result = _fetch_all(query)
+        _cache[key] = (now, result)
+        _cache.move_to_end(key)
+        while len(_cache) > _CACHE_MAX_ENTRIES:
+            _cache.popitem(last=False)
+        return result
 
 
 class TrolleyRetailerAdapter(BaseAdapter):
@@ -214,7 +245,10 @@ class TrolleyRetailerAdapter(BaseAdapter):
         self.retailer_key = key
 
     def search(self, query: str) -> list[ProductResult]:
-        return _cached_lookup(query).get(self.retailer_key, [])
+        try:
+            return _cached_lookup(query).get(self.retailer_key, [])
+        except _SourceUnavailable:
+            return self._mark_unavailable()
 
     def fetch_price(self, external_id: str) -> ProductResult | None:
         return None

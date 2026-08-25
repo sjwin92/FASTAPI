@@ -11,6 +11,7 @@ import re
 import threading
 import requests
 from .base import BaseAdapter, ProductResult
+from .http import REQUEST_TIMEOUT, create_session
 
 _HEADERS = {
     "User-Agent": (
@@ -45,8 +46,7 @@ def _get_session() -> requests.Session:
     global _session
     with _lock:
         if _session is None:
-            _session = requests.Session()
-            _session.headers.update(_HEADERS)
+            _session = create_session(_HEADERS)
     return _session
 
 
@@ -88,12 +88,12 @@ class TescoAdapter(BaseAdapter):
             resp = _get_session().get(
                 _SEARCH_URL,
                 params={"query": query, "format": "json"},
-                timeout=15,
+                timeout=REQUEST_TIMEOUT,
             )
             resp.raise_for_status()
             return _parse_products(resp.text)
         except Exception:
-            return []
+            return self._mark_unavailable()
 
     def fetch_price(self, external_id: str) -> ProductResult | None:
         # Product page also embeds Apollo cache — reuse same parsing
@@ -101,7 +101,7 @@ class TescoAdapter(BaseAdapter):
             resp = _get_session().get(
                 _PRODUCT_URL.format(id=external_id),
                 params={"format": "json"},
-                timeout=15,
+                timeout=REQUEST_TIMEOUT,
             )
             resp.raise_for_status()
             results = _parse_products(resp.text)

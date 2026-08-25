@@ -10,6 +10,7 @@ import re
 import threading
 import requests
 from .base import BaseAdapter, ProductResult
+from .http import REQUEST_TIMEOUT, create_session
 
 _HEADERS = {
     "User-Agent": (
@@ -34,11 +35,10 @@ def _ensure_session() -> requests.Session:
     global _session, _seeded
     with _lock:
         if _session is None:
-            _session = requests.Session()
-            _session.headers.update(_HEADERS)
+            _session = create_session(_HEADERS)
         if not _seeded:
             try:
-                _session.get(_HOME, headers={"Accept": "text/html"}, timeout=15)
+                _session.get(_HOME, headers={"Accept": "text/html"}, timeout=REQUEST_TIMEOUT)
             except Exception:
                 pass
             _seeded = True
@@ -108,12 +108,12 @@ class OcadoAdapter(BaseAdapter):
                     "maxPageSize": 20,
                     "maxProductsToDecorate": 30,
                 },
-                timeout=15,
+                timeout=REQUEST_TIMEOUT,
             )
             resp.raise_for_status()
             data = resp.json()
         except Exception:
-            return []
+            return self._mark_unavailable()
 
         results = []
         for group in data.get("productGroups", []):

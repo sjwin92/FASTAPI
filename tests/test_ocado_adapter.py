@@ -1,4 +1,7 @@
-from unittest.mock import patch, MagicMock
+"""Ocado adapter tests against the currently implemented v6 response shape."""
+
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from app.adapters.ocado import OcadoAdapter
@@ -10,50 +13,47 @@ def adapter():
 
 
 def _mock_response(json_data: dict, status: int = 200):
-    mock = MagicMock()
-    mock.status_code = status
-    mock.json.return_value = json_data
-    mock.raise_for_status = MagicMock()
+    response = MagicMock()
+    response.status_code = status
+    response.json.return_value = json_data
+    response.raise_for_status = MagicMock()
     if status >= 400:
         from requests import HTTPError
-        mock.raise_for_status.side_effect = HTTPError(response=mock)
-    return mock
+
+        response.raise_for_status.side_effect = HTTPError(response=response)
+    return response
 
 
-SEARCH_RESPONSE = {
-    "products": [
-        {
-            "id": "12345",
-            "name": "Organic Whole Milk 2L",
-            "price": {"current": 1.65, "unitPrice": 0.83, "unitOfMeasure": "per litre"},
-            "imageUrl": "https://ocado.com/images/12345.jpg",
-            "availability": "IN_STOCK",
-        },
-        {
-            "id": "67890",
-            "name": "Semi-Skimmed Milk 4 Pints",
-            "price": {"current": 1.35, "unitPrice": 0.59, "unitOfMeasure": "per litre"},
-            "imageUrl": "https://ocado.com/images/67890.jpg",
-            "availability": "IN_STOCK",
-        },
-    ]
-}
-
-PRODUCT_RESPONSE = {
-    "id": "12345",
+PRODUCT = {
+    "retailerProductId": "12345",
     "name": "Organic Whole Milk 2L",
-    "price": {"current": 1.65, "unitPrice": 0.83, "unitOfMeasure": "per litre"},
-    "imageUrl": "https://ocado.com/images/12345.jpg",
-    "availability": "IN_STOCK",
+    "price": {"amount": 1.65},
+    "unitPrice": {"price": {"amount": 0.83}, "unit": "per litre"},
+    "image": {"src": "https://ocado.com/images/12345.jpg"},
+    "available": True,
+    "brand": "Example Dairy",
+    "packSizeDescription": "2L",
 }
+SEARCH_RESPONSE = {
+    "productGroups": [{"decoratedProducts": [PRODUCT]}],
+}
+
+
+def _session_with(response=None, error=None):
+    session = MagicMock()
+    if error:
+        session.get.side_effect = error
+    else:
+        session.get.return_value = response
+    return session
 
 
 def test_search_returns_results(adapter):
-    with patch("app.adapters.ocado._SESSION") as mock_session:
-        mock_session.get.return_value = _mock_response(SEARCH_RESPONSE)
+    session = _session_with(_mock_response(SEARCH_RESPONSE))
+    with patch("app.adapters.ocado._ensure_session", return_value=session):
         results = adapter.search("milk")
 
-    assert len(results) == 2
+    assert len(results) == 1
     assert results[0].external_id == "12345"
     assert results[0].name == "Organic Whole Milk 2L"
     assert results[0].price == 1.65
@@ -62,54 +62,54 @@ def test_search_returns_results(adapter):
     assert results[0].in_stock is True
 
 
-def test_search_empty_when_api_fails(adapter):
-    with patch("app.adapters.ocado._SESSION") as mock_session:
-        mock_session.get.side_effect = Exception("connection error")
-        results = adapter.search("milk")
+def test_search_marks_source_unavailable_when_api_fails(adapter):
+    session = _session_with(error=Exception("connection error"))
+    with patch("app.adapters.ocado._ensure_session", return_value=session):
+        outcome = adapter.search_with_status("milk")
 
-    assert results == []
-
-
-def test_search_empty_when_no_products(adapter):
-    with patch("app.adapters.ocado._SESSION") as mock_session:
-        mock_session.get.return_value = _mock_response({"products": []})
-        results = adapter.search("xyznonexistent")
-
-    assert results == []
+    assert outcome.products == []
+    assert outcome.error_code == "source_unavailable"
 
 
-def test_fetch_price_returns_product(adapter):
-    with patch("app.adapters.ocado._SESSION") as mock_session:
-        mock_session.get.return_value = _mock_response(PRODUCT_RESPONSE)
+def test_search_empty_is_a_genuine_no_match(adapter):
+    session = _session_with(_mock_response({"productGroups": []}))
+    with patch("app.adapters.ocado._ensure_session", return_value=session):
+        outcome = adapter.search_with_status("xyznonexistent")
+
+    assert outcome.products == []
+    assert outcome.error_code is None
+
+
+def test_fetch_price_returns_matching_product(adapter):
+    session = _session_with(_mock_response(SEARCH_RESPONSE))
+    with patch("app.adapters.ocado._ensure_session", return_value=session):
         result = adapter.fetch_price("12345")
 
     assert result is not None
     assert result.external_id == "12345"
     assert result.price == 1.65
-    assert result.in_stock is True
 
 
 def test_fetch_price_returns_none_on_error(adapter):
-    with patch("app.adapters.ocado._SESSION") as mock_session:
-        mock_session.get.side_effect = Exception("not found")
-        result = adapter.fetch_price("99999")
-
-    assert result is None
+    session = _session_with(error=Exception("not found"))
+    with patch("app.adapters.ocado._ensure_session", return_value=session):
+        assert adapter.fetch_price("99999") is None
 
 
-def test_fetch_price_skips_missing_price(adapter):
-    with patch("app.adapters.ocado._SESSION") as mock_session:
-        mock_session.get.return_value = _mock_response({"id": "1", "name": "No price item", "price": {}})
-        result = adapter.fetch_price("1")
-
-    assert result is None
+def test_search_skips_missing_price(adapter):
+    no_price = {**PRODUCT, "price": {}}
+    payload = {"productGroups": [{"decoratedProducts": [no_price]}]}
+    session = _session_with(_mock_response(payload))
+    with patch("app.adapters.ocado._ensure_session", return_value=session):
+        assert adapter.search("milk") == []
 
 
 def test_out_of_stock_flag(adapter):
-    data = {**SEARCH_RESPONSE}
-    data["products"] = [{**SEARCH_RESPONSE["products"][0], "availability": "OUT_OF_STOCK"}]
-    with patch("app.adapters.ocado._SESSION") as mock_session:
-        mock_session.get.return_value = _mock_response(data)
+    payload = {
+        "productGroups": [{"decoratedProducts": [{**PRODUCT, "available": False}]}],
+    }
+    session = _session_with(_mock_response(payload))
+    with patch("app.adapters.ocado._ensure_session", return_value=session):
         results = adapter.search("milk")
 
     assert results[0].in_stock is False

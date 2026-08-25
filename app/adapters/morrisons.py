@@ -3,18 +3,21 @@ Morrisons adapter.
 
 The Morrisons search page embeds full product state in a large JS object.
 Product names + prices appear in adjacent catalog entries.
-Product numeric IDs appear in the embedded URL list (same order).
+Each rendered product card contains its name and URL together.
 
 Approach:
   1. Extract (name, price, unit) tuples from catalog entries in order
-  2. Extract (slug, numeric_id) from embedded /products/{slug}/{id} URLs in order
-  3. Zip them by position (both lists appear in search-result order)
+  2. Extract (name, slug, numeric_id) from each rendered product card
+  3. Join on a normalised name, failing closed when no exact association exists
 """
 from __future__ import annotations
 
 import re
-import requests
+from collections import defaultdict, deque
+from html import unescape
+
 from .base import BaseAdapter, ProductResult
+from .http import REQUEST_TIMEOUT, create_session
 
 _HEADERS = {
     "User-Agent": (
@@ -35,14 +38,15 @@ _CATALOG_RE = re.compile(
     r'(?:,"unit":\{"label":"([^"]*)"[^}]*"amount":"([\d.]+)")?'
 )
 
-# Product URLs embedded in the page
-_URL_RE = re.compile(r'href="/products/([a-z0-9-]+)/(\d+)"')
+# The accessible product name is nested directly inside its product-card anchor.
+# Keeping these fields in one regex prevents the historical positional zip bug.
+_CARD_LINK_RE = re.compile(
+    r'href="/products/([a-z0-9-]+)/(\d+)"[^>]*>'
+    r'\s*<span class="salt-vc">([^<]+)</span>',
+    re.IGNORECASE,
+)
 
-# Image URLs for products — 300x300 versions from Morrisons CDN
-_IMG_RE = re.compile(r'"src":"(https://groceries\.morrisons\.com/images[^"]+300x300\.jpg)"')
-
-_session = requests.Session()
-_session.headers.update(_HEADERS)
+_session = create_session(_HEADERS)
 
 
 def _unit_label_to_unit(label: str) -> str | None:
@@ -52,21 +56,31 @@ def _unit_label_to_unit(label: str) -> str | None:
     return parts[-1] if parts else None
 
 
+def _name_key(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", unescape(value).lower()))
+
+
 def _parse_products(html: str) -> list[ProductResult]:
     catalog = _CATALOG_RE.findall(html)
-    urls = list(dict.fromkeys(_URL_RE.findall(html)))  # preserve order, deduplicate
-    images = _IMG_RE.findall(html)
+    links_by_name: dict[str, deque[tuple[str, str]]] = defaultdict(deque)
+    seen_links: set[tuple[str, str]] = set()
+    for slug, product_id, card_name in _CARD_LINK_RE.findall(html):
+        link = (slug, product_id)
+        if link not in seen_links:
+            links_by_name[_name_key(card_name)].append(link)
+            seen_links.add(link)
 
     results = []
-    for i, (name, price_str, unit_label, unit_amount_str) in enumerate(catalog):
+    for name, price_str, unit_label, unit_amount_str in catalog:
         try:
             price = float(price_str)
         except ValueError:
             continue
 
-        slug, pid = urls[i] if i < len(urls) else ("", "")
-        if not pid:
+        matching_links = links_by_name.get(_name_key(name))
+        if not matching_links:
             continue
+        slug, pid = matching_links.popleft()
 
         unit_price = None
         if unit_amount_str:
@@ -77,8 +91,6 @@ def _parse_products(html: str) -> list[ProductResult]:
                 pass
 
         unit = _unit_label_to_unit(unit_label)
-        image_url = images[i] if i < len(images) else None
-
         results.append(ProductResult(
             external_id=pid,
             name=name,
@@ -86,7 +98,8 @@ def _parse_products(html: str) -> list[ProductResult]:
             price=price,
             unit_price=unit_price,
             unit=unit,
-            image_url=image_url,
+            # Omit an image rather than risk the same positional-association bug.
+            image_url=None,
             in_stock=True,  # Non-available products don't appear in search results
         ))
     return results
@@ -97,17 +110,17 @@ class MorrisonsAdapter(BaseAdapter):
 
     def search(self, query: str) -> list[ProductResult]:
         try:
-            resp = _session.get(_SEARCH_URL, params={"entry": query}, timeout=15)
+            resp = _session.get(_SEARCH_URL, params={"entry": query}, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             return _parse_products(resp.text)
         except Exception:
-            return []
+            return self._mark_unavailable()
 
     def fetch_price(self, external_id: str) -> ProductResult | None:
         try:
             resp = _session.get(
                 f"{_PRODUCT_BASE}/products/product/{external_id}",
-                timeout=15,
+                timeout=REQUEST_TIMEOUT,
             )
             resp.raise_for_status()
             results = _parse_products(resp.text)

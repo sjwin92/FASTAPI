@@ -37,6 +37,7 @@ from typing import Any
 import requests
 
 from .base import BaseAdapter, ProductResult
+from .http import REQUEST_TIMEOUT, create_session
 
 _BASE = "https://www.sainsburys.co.uk"
 _HOME = f"{_BASE}/"
@@ -166,7 +167,7 @@ class SainsburysAdapter(BaseAdapter):
     retailer_key = "sainsburys"
 
     def __init__(self) -> None:
-        self._session = requests.Session()
+        self._session = create_session({})
         self._seeded = False
         self._lock = threading.Lock()
 
@@ -181,7 +182,7 @@ class SainsburysAdapter(BaseAdapter):
         regardless and are sufficient for subsequent API calls.
         """
         try:
-            self._session.get(_HOME, headers=_NAV_HEADERS, timeout=15)
+            self._session.get(_HOME, headers=_NAV_HEADERS, timeout=REQUEST_TIMEOUT)
         except Exception:
             pass
         self._seeded = True
@@ -195,13 +196,13 @@ class SainsburysAdapter(BaseAdapter):
         """Make an API GET, re-seeding the session once on 403."""
         self._ensure_session()
         try:
-            resp = self._session.get(url, params=params, headers=_API_HEADERS, timeout=15)
+            resp = self._session.get(url, params=params, headers=_API_HEADERS, timeout=REQUEST_TIMEOUT)
             if resp.status_code == 403:
                 # Cookie set may have expired — re-seed once and retry
                 with self._lock:
                     self._seeded = False
                     self._seed_session()
-                resp = self._session.get(url, params=params, headers=_API_HEADERS, timeout=15)
+                resp = self._session.get(url, params=params, headers=_API_HEADERS, timeout=REQUEST_TIMEOUT)
             return resp
         except Exception:
             return None
@@ -213,11 +214,11 @@ class SainsburysAdapter(BaseAdapter):
     def search(self, query: str) -> list[ProductResult]:
         resp = self._get(_SEARCH_API, params={"filter[keyword]": query, "pageSize": "20"})
         if resp is None or resp.status_code != 200:
-            return []
+            return self._mark_unavailable("http_error")
         try:
             data = resp.json()
         except Exception:
-            return []
+            return self._mark_unavailable("invalid_response")
 
         results: list[ProductResult] = []
         for item in data.get("products") or []:

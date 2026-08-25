@@ -20,16 +20,14 @@ import json
 import re
 from typing import Any
 
-import requests
-
 from .base import BaseAdapter, ProductResult
+from .http import REQUEST_TIMEOUT, create_session
 
 _BASE_URL = "https://www.waitrose.com"
 _PRODUCT_BASE = f"{_BASE_URL}/ecom/products"
 _SEARCH_URL = f"{_BASE_URL}/ecom/shop/search"
 
-_SESSION = requests.Session()
-_SESSION.headers.update({
+_SESSION = create_session({
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -262,12 +260,12 @@ class WaitroseAdapter(BaseAdapter):
             resp = _SESSION.get(
                 _SEARCH_URL,
                 params={"searchTerm": query},
-                timeout=8,
+                timeout=REQUEST_TIMEOUT,
             )
             resp.raise_for_status()
             html = resp.text
         except Exception:
-            return []
+            return self._mark_unavailable()
 
         # Try __NEXT_DATA__ first — richer data including promo/brand/size
         next_data = _extract_next_data(html)
@@ -293,7 +291,7 @@ class WaitroseAdapter(BaseAdapter):
     def fetch_price(self, external_id: str) -> ProductResult | None:
         url = f"{_PRODUCT_BASE}/{external_id}"
         try:
-            resp = _SESSION.get(url, timeout=8)
+            resp = _SESSION.get(url, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             html = resp.text
         except Exception:

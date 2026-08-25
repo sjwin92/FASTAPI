@@ -1,7 +1,20 @@
-from fastapi import FastAPI, Depends, HTTPException, Query
+from collections import defaultdict, deque
+import json
+import logging
+import os
+import re
+import secrets
+import threading
+import time
+import uuid
+
+from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.db import get_db
+from app.db import engine, get_db
 from app.schemas import (
     ProductResult,
     TrackRequest,
@@ -16,18 +29,115 @@ from app.schemas import (
     BasketCompareResponse,
     RetailerBasketResult,
     BasketItem,
+    AdapterErrorInfo,
 )
 from app.adapters.registry import RETAILER_NAMES
 from app.services.products import search_products, track_product, get_price_history, refresh_prices
 from app.services.price_sync import find_best_prices, compare_basket
 from app.supabase_sync import build_price_row, upsert_ingredient_prices
 
-app = FastAPI(title="Supermarket Price Tracker API")
+logger = logging.getLogger("kitchen_companion.pricing")
+app = FastAPI(
+    title="Kitchen Companion Pricing API",
+    description="Basket pricing for Kitchen Companion's buy-missing-items workflow.",
+    version="1.1.0",
+)
+
+_cors_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+    )
+
+_rate_limit = max(0, int(os.getenv("RATE_LIMIT_REQUESTS_PER_MINUTE", "60")))
+_rate_buckets: dict[str, deque[float]] = defaultdict(deque)
+_rate_lock = threading.Lock()
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+
+
+@app.middleware("http")
+async def request_context(request: Request, call_next):
+    incoming_id = request.headers.get("X-Request-ID", "")
+    request_id = incoming_id if _REQUEST_ID_RE.fullmatch(incoming_id) else str(uuid.uuid4())
+    started = time.monotonic()
+
+    if _rate_limit and request.url.path in {"/basket/compare", "/price-sync"}:
+        client = request.client.host if request.client else "unknown"
+        key = f"{client}:{request.url.path}"
+        now = time.monotonic()
+        with _rate_lock:
+            bucket = _rate_buckets[key]
+            while bucket and bucket[0] <= now - 60:
+                bucket.popleft()
+            if len(bucket) >= _rate_limit:
+                response = JSONResponse(
+                    status_code=429,
+                    content={"detail": "Rate limit exceeded. Try again shortly."},
+                )
+                response.headers["X-Request-ID"] = request_id
+                return response
+            bucket.append(now)
+
+    response = await call_next(request)
+    duration_ms = round((time.monotonic() - started) * 1000)
+    response.headers["X-Request-ID"] = request_id
+    logger.info(
+        json.dumps(
+            {
+                "event": "http_request",
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "status": response.status_code,
+                "duration_ms": duration_ms,
+            },
+            separators=(",", ":"),
+        )
+    )
+    return response
+
+
+def require_service_auth(authorization: str | None = Header(default=None)) -> None:
+    """Optional server-to-server auth; never place this secret in browser code."""
+    expected = os.getenv("BASKET_API_KEY", "")
+    if not expected:
+        return
+    scheme, _, supplied = (authorization or "").partition(" ")
+    if scheme.casefold() != "bearer" or not secrets.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing bearer token")
 
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready():
+    """Report process readiness without requiring a database for stateless routes."""
+    database_required = os.getenv("DATABASE_REQUIRED", "false").casefold() == "true"
+    if not database_required:
+        return {
+            "status": "ready",
+            "dependencies": {"database": "optional_not_checked"},
+        }
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "dependencies": {"database": "unavailable"}},
+        )
+    return {"status": "ready", "dependencies": {"database": "available"}}
 
 
 @app.get("/retailers", response_model=list[RetailerInfo])
@@ -101,7 +211,11 @@ def refresh(db: Session = Depends(get_db)):
     return {"refreshed": count}
 
 
-@app.post("/price-sync", response_model=PriceSyncResponse)
+@app.post(
+    "/price-sync",
+    response_model=PriceSyncResponse,
+    dependencies=[Depends(require_service_auth)],
+)
 def price_sync(payload: PriceSyncRequest):
     """
     Find the best retailer product for each ingredient and optionally
@@ -146,11 +260,16 @@ def price_sync(payload: PriceSyncRequest):
     return PriceSyncResponse(
         synced=synced_items,
         not_found=result.not_found,
+        errors=[AdapterErrorInfo(**error.__dict__) for error in result.errors],
         written_to_supabase=written,
     )
 
 
-@app.post("/basket/compare", response_model=BasketCompareResponse)
+@app.post(
+    "/basket/compare",
+    response_model=BasketCompareResponse,
+    dependencies=[Depends(require_service_auth)],
+)
 def basket_compare(payload: BasketCompareRequest):
     """
     Compare the cost of a basket of ingredients across all supported retailers.
@@ -169,6 +288,13 @@ def basket_compare(payload: BasketCompareRequest):
                 total=b.total,
                 items=[BasketItem(**item) for item in b.items],
                 not_found=b.not_found,
+                matched_count=b.matched_count,
+                requested_count=b.requested_count,
+                is_complete=b.is_complete,
+                availability=b.availability,
+                total_is_comparable=b.total_is_comparable,
+                errors=[AdapterErrorInfo(**error.__dict__) for error in b.errors],
+                duration_ms=b.duration_ms,
             )
             for b in baskets
         ]
