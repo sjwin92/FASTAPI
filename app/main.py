@@ -37,12 +37,14 @@ from app.adapters.registry import RETAILER_NAMES, retailer_metadata
 from app.services.products import search_products, track_product, get_price_history, refresh_prices
 from app.services.price_sync import BasketQuantityRequest, find_best_prices, compare_basket
 from app.supabase_sync import build_price_row, upsert_ingredient_prices
+from app.shopping_schemas import ShoppingPlanRequest, ShoppingPlanResponse
+from app.services.shopping_plan import build_shopping_plan
 
 logger = logging.getLogger("kitchen_companion.pricing")
 app = FastAPI(
     title="Kitchen Companion Pricing API",
     description="Basket pricing for Kitchen Companion's buy-missing-items workflow.",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 _cors_origins = [
@@ -71,7 +73,11 @@ async def request_context(request: Request, call_next):
     request_id = incoming_id if _REQUEST_ID_RE.fullmatch(incoming_id) else str(uuid.uuid4())
     started = time.monotonic()
 
-    if _rate_limit and request.url.path in {"/basket/compare", "/price-sync"}:
+    if _rate_limit and request.url.path in {
+        "/basket/compare",
+        "/price-sync",
+        "/shopping/plan",
+    }:
         client = request.client.host if request.client else "unknown"
         key = f"{client}:{request.url.path}"
         now = time.monotonic()
@@ -318,3 +324,22 @@ def basket_compare(payload: BasketCompareRequest):
             for b in baskets
         ]
     )
+
+
+@app.post(
+    "/shopping/plan",
+    response_model=ShoppingPlanResponse,
+    dependencies=[Depends(require_service_auth)],
+)
+def shopping_plan(payload: ShoppingPlanRequest):
+    """Net scheduled demand against pantry stock and price complete plans."""
+    supplied_retailers = set(payload.allowed_retailers or []) | set(
+        payload.retailer_costs
+    )
+    unknown = sorted(supplied_retailers - set(RETAILER_NAMES))
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown retailer keys: {', '.join(unknown)}",
+        )
+    return build_shopping_plan(payload)

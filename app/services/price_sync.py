@@ -176,6 +176,20 @@ class CoverageIssue:
     candidate_product_name: str | None = None
 
 
+@dataclass(frozen=True)
+class QuantityCandidate:
+    product: ProductResult
+    retailer: str
+    score: float
+    requested: NormalizedQuantity
+    package: PackageMeasure
+    packs_needed: int
+    supplied_base: Decimal
+    excess_base: Decimal
+    line_total: Decimal
+    unallocated_value: Decimal
+
+
 @dataclass
 class IngredientMatch:
     ingredient: str
@@ -206,32 +220,34 @@ class _SearchRequest:
     quantity: NormalizedQuantity | None = None
 
 
-def _quantity_match(
-    request: _SearchRequest,
+def quantity_candidate_frontier(
+    query: str,
+    requested: NormalizedQuantity,
     candidates: list[tuple[ProductResult, str]],
-) -> tuple[IngredientMatch | None, CoverageIssue | None]:
-    assert request.quantity is not None
-    tokens = _normalise(request.ingredient)
+    max_candidates: int = 5,
+) -> tuple[list[QuantityCandidate], CoverageIssue | None]:
+    """Return non-dominated purchasable package choices for one requirement."""
+    tokens = _normalise(query)
     semantic: list[tuple[ProductResult, float, str]] = []
     for candidate, retailer_key in candidates:
         score = _relevance(tokens, candidate.name)
         if candidate.in_stock and score >= 1.0:
             semantic.append((candidate, score, retailer_key))
     if not semantic:
-        return None, None
+        return [], None
 
     acceptable = [
         (candidate, score, retailer_key)
         for candidate, score, retailer_key in semantic
-        if _variant_is_acceptable(request.ingredient, candidate.name)
+        if _variant_is_acceptable(query, candidate.name)
     ]
     if not acceptable:
         candidate = min(
             semantic,
             key=lambda entry: (-entry[1], entry[0].external_id, entry[2]),
         )[0]
-        return None, CoverageIssue(
-            request.ingredient,
+        return [], CoverageIssue(
+            query,
             "no_acceptable_variant",
             _COVERAGE_MESSAGES["no_acceptable_variant"],
             candidate.name,
@@ -249,7 +265,7 @@ def _quantity_match(
     compatible = [
         (candidate, score, retailer_key, package)
         for candidate, score, retailer_key, package in measured
-        if package is not None and package.dimension == request.quantity.dimension
+        if package is not None and package.dimension == requested.dimension
     ]
     if not compatible:
         unknown = [entry for entry in measured if entry[3] is None]
@@ -259,50 +275,125 @@ def _quantity_match(
             key=lambda entry: (-entry[1], entry[0].external_id, entry[2]),
         )[0]
         code = "package_size_unknown" if unknown else "unit_incompatible"
-        return None, CoverageIssue(
-            request.ingredient,
+        return [], CoverageIssue(
+            query,
             code,
             _COVERAGE_MESSAGES[code],
             candidate.name,
         )
 
-    ranked: list[tuple[tuple[Decimal, Decimal, float, str], IngredientMatch]] = []
+    choices: list[QuantityCandidate] = []
     for candidate, score, retailer_key, package in compatible:
         assert package is not None
         price = Decimal(str(candidate.price))
         if not price.is_finite() or price <= 0:
             continue
-        pack_count = packs_required(request.quantity.base_amount, package.amount)
+        pack_count = packs_required(requested.base_amount, package.amount)
         supplied_base = package.amount * pack_count
-        excess_base = supplied_base - request.quantity.base_amount
+        excess_base = supplied_base - requested.base_amount
         line_total = money(price * pack_count)
-        match = IngredientMatch(
-            ingredient=request.ingredient,
-            product=candidate,
-            retailer=retailer_key,
-            requested_quantity=request.quantity.amount,
-            requested_unit=request.quantity.unit,
-            package_quantity=package.amount,
-            package_unit=package.unit,
-            packs_needed=pack_count,
-            supplied_quantity=amount_in_unit(supplied_base, request.quantity.unit),
-            excess_quantity=amount_in_unit(excess_base, request.quantity.unit),
-            line_total=line_total,
+        unallocated_value = money(
+            line_total * excess_base / supplied_base
         )
-        ranked.append(
-            ((line_total, excess_base, -score, candidate.external_id), match)
+        choices.append(
+            QuantityCandidate(
+                product=candidate,
+                retailer=retailer_key,
+                score=score,
+                requested=requested,
+                package=package,
+                packs_needed=pack_count,
+                supplied_base=supplied_base,
+                excess_base=excess_base,
+                line_total=line_total,
+                unallocated_value=unallocated_value,
+            )
         )
 
-    if not ranked:
+    if not choices:
         candidate = min(
             acceptable,
             key=lambda entry: (-entry[1], entry[0].external_id, entry[2]),
         )[0]
-        return None, CoverageIssue(
-            request.ingredient,
+        return [], CoverageIssue(
+            query,
             "package_size_unknown",
             _COVERAGE_MESSAGES["package_size_unknown"],
             candidate.name,
+        )
+
+    frontier = []
+    for choice in choices:
+        dominated = any(
+            other is not choice
+            and other.line_total <= choice.line_total
+            and other.unallocated_value <= choice.unallocated_value
+            and other.score >= choice.score
+            and (
+                other.line_total < choice.line_total
+                or other.unallocated_value < choice.unallocated_value
+                or other.score > choice.score
+            )
+            for other in choices
+        )
+        if not dominated:
+            frontier.append(choice)
+    frontier.sort(
+        key=lambda choice: (
+            choice.line_total,
+            choice.unallocated_value,
+            choice.excess_base,
+            -choice.score,
+            choice.product.external_id,
+            choice.retailer,
+        )
+    )
+    return frontier[:max_candidates], None
+
+
+def _quantity_match(
+    request: _SearchRequest,
+    candidates: list[tuple[ProductResult, str]],
+) -> tuple[IngredientMatch | None, CoverageIssue | None]:
+    assert request.quantity is not None
+    frontier, issue = quantity_candidate_frontier(
+        request.ingredient,
+        request.quantity,
+        candidates,
+        max_candidates=max(5, len(candidates)),
+    )
+    if not frontier:
+        return None, issue
+
+    ranked: list[tuple[tuple[Decimal, Decimal, float, str], IngredientMatch]] = []
+    for choice in frontier:
+        match = IngredientMatch(
+            ingredient=request.ingredient,
+            product=choice.product,
+            retailer=choice.retailer,
+            requested_quantity=request.quantity.amount,
+            requested_unit=request.quantity.unit,
+            package_quantity=choice.package.amount,
+            package_unit=choice.package.unit,
+            packs_needed=choice.packs_needed,
+            supplied_quantity=amount_in_unit(
+                choice.supplied_base, request.quantity.unit
+            ),
+            excess_quantity=amount_in_unit(
+                choice.excess_base, request.quantity.unit
+            ),
+            line_total=choice.line_total,
+        )
+        ranked.append(
+            (
+                (
+                    choice.line_total,
+                    choice.excess_base,
+                    -choice.score,
+                    choice.product.external_id,
+                ),
+                match,
+            )
         )
     return min(ranked, key=lambda entry: entry[0])[1], None
 

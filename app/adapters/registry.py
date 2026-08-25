@@ -64,7 +64,13 @@ def retailer_metadata() -> list[dict]:
                     else "Automated source disabled pending permission."
                 ),
                 "capabilities": (
-                    ["search", "basket_compare", "quantity_aware"]
+                    [
+                        "search",
+                        "basket_compare",
+                        "quantity_aware",
+                        "shopping_plan",
+                        "split_plan",
+                    ]
                     if enabled else []
                 ),
             }

@@ -7,7 +7,7 @@ Retail prices come from fragile public retailer surfaces. Results are estimates,
 ## Requirements
 
 - Python 3.12 (the declared and CI-tested version)
-- PostgreSQL only for tracking/history endpoints; stateless endpoints such as `/health`, `/ready`, `/retailers`, `/price-sync`, and `/basket/compare` start without a database connection
+- PostgreSQL only for tracking/history endpoints; stateless endpoints such as `/health`, `/ready`, `/retailers`, `/price-sync`, `/basket/compare`, and `/shopping/plan` start without a database connection
 
 ## Local setup
 
@@ -29,6 +29,9 @@ curl -X POST http://127.0.0.1:8000/basket/compare \
 curl -X POST http://127.0.0.1:8000/basket/compare \
   -H 'Content-Type: application/json' \
   -d '{"items":[{"name":"milk","quantity":1,"unit":"l"}]}'
+curl -X POST http://127.0.0.1:8000/shopping/plan \
+  -H 'Content-Type: application/json' \
+  -d '{"shopping_on":"2026-09-01","requirements":[{"requirement_key":"meal-1:milk","ingredient_key":"milk:fresh","name":"fresh milk","quantity":500,"unit":"ml","needed_on":"2026-09-02"}],"pantry_lots":[]}'
 ```
 
 Run verification with:
@@ -48,6 +51,7 @@ No environment variable is required for stateless local comparison.
 | `CORS_ALLOWED_ORIGINS` | none | Comma-separated exact browser origins. Wildcard CORS is not enabled. |
 | `RATE_LIMIT_REQUESTS_PER_MINUTE` | `60` | Per-process, per-client limit for comparison and sync routes; `0` disables it. Use an edge/shared limiter when scaling to multiple instances. |
 | `MAX_ADAPTER_WORKERS` | `4` | Bounded retailer request concurrency, clamped to 1–8. |
+| `SHOPPING_PLAN_MAX_OPTIMIZER_STATES` | `200000` | Exact shopping-plan frontier limit, clamped to 10,000–1,000,000. A limit hit fails closed instead of returning an approximate optimum. |
 | `ADAPTER_CONNECT_TIMEOUT_SECONDS` | `3.05` | Retailer connection timeout. |
 | `ADAPTER_READ_TIMEOUT_SECONDS` | `8` | Retailer response timeout. |
 | `ADAPTER_MAX_RETRIES` | `1` | Bounded GET retry count, clamped to 0–2. |
@@ -146,6 +150,63 @@ Ranking is `available` complete baskets first, then partial baskets by matched c
 
 Matching requires every meaningful query token and rejects unrequested material forms such as UHT/long-life, powdered, dried, frozen, canned/tinned, condensed, evaporated, flavoured, ready-cooked, and breaded. Structured selection requires an in-stock product with a compatible known package size. It chooses the lowest line checkout cost, then least excess, strongest match, and stable product ID. Conditional promotions, loyalty prices, and multibuy text are not applied.
 
+## Pantry-to-purchase planning
+
+`POST /shopping/plan` is a stateless bridge between Kitchen Companion's meal plan, pantry, shopping list, and expiry tracking. Kitchen Companion remains the source of truth and sends stable requirement, ingredient, and pantry-lot keys.
+
+```json
+{
+  "shopping_on": "2026-09-01",
+  "requirements": [
+    {
+      "requirement_key": "meal-42:milk",
+      "ingredient_key": "ingredient:milk:fresh",
+      "name": "fresh milk",
+      "quantity": 500,
+      "unit": "ml",
+      "needed_on": "2026-09-02",
+      "source_refs": ["meal-42"]
+    }
+  ],
+  "pantry_lots": [
+    {
+      "lot_key": "pantry-lot-901",
+      "ingredient_key": "ingredient:milk:fresh",
+      "available_quantity": 250,
+      "unit": "ml",
+      "expires_on": "2026-09-02"
+    }
+  ],
+  "allowed_retailers": ["ocado", "morrisons"],
+  "retailer_costs": {
+    "ocado": {
+      "method": "delivery",
+      "fixed_cost_gbp": 3.99,
+      "minimum_spend_gbp": 40.00
+    },
+    "morrisons": {
+      "method": "in_store",
+      "fixed_cost_gbp": 2.50,
+      "minimum_spend_gbp": 0
+    }
+  }
+}
+```
+
+The planner allocates usable pantry stock by required date and earliest expiry, with unknown-expiry lots last. It searches only for the remaining quantities. Relevant stock expiring too early, unknown-expiry allocations, and unused expiring stock are returned as `pantry_insights`. If pantry stock covers the plan, the response is `pantry_only` and no retailer is contacted.
+
+Complete options use one retailer or at most two. One ingredient key is always purchased wholly from one retailer. The exact optimizer enforces supplied minimum spends, adds fixed trip/delivery cost once per used store, and retains non-dominated checkout-cost and package-surplus choices. It never adds basket filler. Policy-disabled sources are reported as excluded and receive no network requests.
+
+`decision_status` controls presentation:
+
+- `ready` and `pantry_only` are safe to present as decision choices.
+- `needs_store_costs` means split plans are merchandise-only estimates; missing costs are never assumed to be zero.
+- `source_uncertain`, `optimization_limited`, and `no_complete_plan` must be shown as observed or incomplete results, not a proven cheapest plan.
+
+When the decision is ready, `pareto_labels` identify the fewest-store, lowest-landed-cost, and least-unallocated-value options. The unallocated value is a proportional estimate of purchased value not assigned to the current meal plan, not predicted food waste.
+
+Every option includes a provisional purchase manifest. Kitchen Companion must confirm the actual checkout product, packs, and price before adding the full `purchased_quantity` to inventory. The pricing service never writes pantry or purchase state.
+
 ## Endpoints
 
 | Method | Path | Database needed | Description |
@@ -155,18 +216,21 @@ Matching requires every meaningful query token and rejects unrequested material 
 | GET | `/retailers` | No | Retailer keys, configured enablement, reason, and capabilities. |
 | GET | `/search` | No | Search one or all adapters with the source retailer on every result. |
 | POST | `/basket/compare` | No | Compare complete and partial baskets safely. |
+| POST | `/shopping/plan` | No | Net scheduled demand against pantry lots and return exact one/two-store plans. |
 | POST | `/price-sync` | No | Match ingredients; legacy write is opt-in. |
 | POST | `/track` | Yes | Track a selected product. |
 | GET | `/history/{product_id}` | Yes | Read captured prices. |
 | POST | `/refresh` | Yes | Refresh actively tracked products. |
 
-Every response includes `X-Request-ID`. HTTP and adapter timings are logged without credentials. Upstream exception details are intentionally not returned to clients.
+Every response includes `X-Request-ID`. HTTP, adapter, and planner timings are logged without credentials or household ingredient, lot, meal, or requirement text. Upstream exception details are intentionally not returned to clients.
 
 ## Source limitations and responsible use
 
 Tesco and Trolley explicitly prohibit automated access without permission, so those providers are disabled by default. This makes Tesco, Asda, and Iceland visibly unavailable until an authorised source is configured. Other integrations use undocumented or changing retailer surfaces and may be blocked by CDNs or server IP policy. See [docs/SOURCE_POLICY.md](docs/SOURCE_POLICY.md) before any production use.
 
 Recorded, sanitised response fragments cover parser formats in tests. Live checks are intentionally minimal and must not target policy-disabled sources.
+
+The latest pantry-aware smoke record is [docs/SMOKE_TEST_2026-08-26.md](docs/SMOKE_TEST_2026-08-26.md).
 
 The copyable consumer integration notes are in [docs/FRONTEND_HANDOFF.md](docs/FRONTEND_HANDOFF.md).
 

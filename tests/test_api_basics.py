@@ -156,6 +156,8 @@ def test_retailers_expose_configured_status_and_capabilities(client):
     by_key = {retailer["key"]: retailer for retailer in response.json()}
     assert by_key["sainsburys"]["enabled"] is True
     assert "quantity_aware" in by_key["sainsburys"]["capabilities"]
+    assert "shopping_plan" in by_key["sainsburys"]["capabilities"]
+    assert "split_plan" in by_key["sainsburys"]["capabilities"]
     assert by_key["tesco"]["enabled"] is False
     assert by_key["tesco"]["disabled_reason"]
     assert by_key["tesco"]["capabilities"] == []
@@ -163,7 +165,7 @@ def test_retailers_expose_configured_status_and_capabilities(client):
 
 def test_openapi_describes_quantity_contract_and_version(client):
     schema = client.get("/openapi.json").json()
-    assert schema["info"]["version"] == "1.2.0"
+    assert schema["info"]["version"] == "1.3.0"
     basket_request = schema["components"]["schemas"]["BasketCompareRequest"]
     assert {"ingredients", "items"} <= basket_request["properties"].keys()
     item = schema["components"]["schemas"]["BasketRequestItem"]

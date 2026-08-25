@@ -1,4 +1,4 @@
-# Frontend handoff — basket API 1.2.0
+# Frontend handoff — pricing API 1.3.0
 
 Kitchen Companion can keep sending the legacy request unchanged:
 
@@ -31,6 +31,42 @@ Send exactly one of `ingredients` or `items`. Valid structured units are `g`, `k
 
 All new response properties are additive. Legacy requests return `calculation_mode: "one_pack"`; their one-package totals are unchanged.
 
+## Closed-loop shopping plans
+
+Use `POST /shopping/plan` when Kitchen Companion has scheduled meal demand and pantry quantities. Keep `/basket/compare` for a direct price comparison without pantry allocation.
+
+The app must supply:
+
+- a unique `requirement_key` for every scheduled ingredient requirement;
+- a stable `ingredient_key` shared by requirements and matching pantry lots;
+- `available_quantity` after subtracting reservations managed elsewhere in Kitchen Companion;
+- `shopping_on`, `needed_on`, and optional pantry `expires_on` dates;
+- an explicit fixed cost and minimum spend for every retailer when landed-cost decisions are wanted.
+
+Do not merge pantry and demand by display name. Distinct forms such as dairy milk and oat milk need distinct ingredient keys.
+
+### Planner rendering rules
+
+- Only use decision language when `decision_status` is `ready` or `pantry_only`.
+- With `needs_store_costs`, display split results as merchandise-only estimates and request the missing journey/delivery preferences.
+- With `source_uncertain`, `optimization_limited`, or `no_complete_plan`, show the supplied diagnostics and do not claim the cheapest plan is known.
+- Present the IDs in `pareto_option_ids` as the non-dominated choices. `pareto_labels` identifies convenience, landed-cost, and surplus-value leaders; one option can hold several labels.
+- Explain that `unallocated_purchase_value_gbp` is value not allocated to this meal plan, not predicted waste.
+- Surface `pantry_insights` near the relevant meal or pantry lot. Unknown-expiry stock is usable but was deliberately allocated after dated stock.
+- Policy-disabled retailers appear as `excluded` diagnostics and must not be presented as live failures.
+
+### Purchase confirmation
+
+The option's `purchase_manifest` is a preview. At checkout, let the user confirm or edit product, pack count, and price. Only then should Kitchen Companion create the inventory lot using the actual full purchased quantity. Preserve `plan_fingerprint`, `option_id`, and `manifest_line_id` in app-owned audit metadata if useful.
+
+Do not add only the unallocated quantity to inventory: the full purchase enters the pantry, while Kitchen Companion's meal reservations account for `planned_use_quantity`.
+
+Conservation must remain visible in integration tests:
+
+```text
+purchased_quantity = planned_use_quantity + unallocated_quantity
+```
+
 ## Server configuration
 
 The Kitchen Companion server should set:
@@ -38,7 +74,7 @@ The Kitchen Companion server should set:
 - `PRICING_API_URL` to the deployed API base URL when one exists.
 - `PRICING_API_KEY` only if the pricing service has `BASKET_API_KEY` configured.
 
-Keep the key server-side and send it as `Authorization: Bearer …`. No deployment URL was created by this change. The pricing API does not require Supabase for basket comparison.
+Keep the key server-side and send it as `Authorization: Bearer …`. The same authentication applies to `/shopping/plan`. No deployment URL was created by this change. The pricing API does not require Supabase for basket comparison or shopping plans.
 
 ## Known limitations
 
