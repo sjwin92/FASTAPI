@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: kitchen-companion-pricing
+    runtime: docker
+    plan: free
+    region: frankfurt
+    branch: main
+    healthCheckPath: /health
+    autoDeployTrigger: checksPass
+    envVars:
+      - key: BASKET_API_KEY
+        sync: false
+      - key: DATABASE_REQUIRED
+        value: "false"
+      - key: ENABLE_RESTRICTED_SOURCES
+        value: "false"
+      - key: RATE_LIMIT_REQUESTS_PER_MINUTE
+        value: "30"
+      - key: MAX_ADAPTER_WORKERS
+        value: "4"

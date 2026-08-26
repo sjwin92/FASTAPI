@@ -234,13 +234,21 @@ The latest pantry-aware smoke record is [docs/SMOKE_TEST_2026-08-26.md](docs/SMO
 
 The copyable consumer integration notes are in [docs/FRONTEND_HANDOFF.md](docs/FRONTEND_HANDOFF.md).
 
-## Docker and low-cost hosting
+## Docker and free beta hosting
 
 ```bash
 docker build -t kitchen-companion-pricing .
 docker run --rm -p 8000:8000 kitchen-companion-pricing
 ```
 
-The container runs as a non-root user and scales to zero cleanly. [Google Cloud Run pricing](https://cloud.google.com/run/pricing) documents monthly free allowances, but the service is pay-as-you-go beyond them and requires a billing account. Set a budget alert and maximum instances before deployment. **This repository is not deployed by this change, and no cost-bearing resource was created.**
+The container runs as a non-root user and scales to zero cleanly. The included
+`render.yaml` defines a single free Render web service in Frankfurt, keeps
+policy-restricted retailer sources disabled, and requires a server-only basket
+API key supplied during Blueprint setup. Free services sleep when idle, so the
+first beta comparison after a quiet period can take longer while the service
+wakes up.
+
+No database is required for `/basket/compare` or `/shopping/plan`. Do not add a
+paid database or persistent disk for the beta comparison service.
 
 For production, put the API behind the Kitchen Companion server. Configure that server with `PRICING_API_URL` and, if enabled here, a server-only `PRICING_API_KEY` whose value matches this service's `BASKET_API_KEY`. Do not call the authenticated endpoint directly from public browser JavaScript.
